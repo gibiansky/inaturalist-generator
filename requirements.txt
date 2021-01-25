@@ -1,0 +1,6 @@
+click
+data-science-types
+numpy
+torch
+pytorch-lightning
+omegaconf

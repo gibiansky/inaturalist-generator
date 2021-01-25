@@ -1,0 +1,27 @@
+encoder:
+  init_channels: 16
+  init_kernel_size: 9
+  downsampling: [2, 2, 2, 2, 2]
+  layers_per_scale: 2
+  kernel_size: 5
+
+quantizers:
+  count: 2
+  classes: 1024
+  start_anneal: 10000
+  stop_anneal: 100000
+  max_temp: 2.0
+  min_temp: 0.5
+
+decoder:
+  init_channels: 1024
+  final_kernel_size: 9
+  upsampling: [2, 2, 2, 2, 2]
+  layers_per_scale: 2
+  kernel_size: 5
+
+data:
+  batch_size: 8
+
+adam:
+  lr: 2.0e-4
