@@ -2,8 +2,9 @@
 A model for quantizing images to integer codes.
 """
 import time
+import glob
 import random
-from typing import List, Any
+from typing import List, Any, Set, Tuple
 import os
 
 import click
@@ -15,12 +16,16 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image  # type: ignore
 from pytorch_lightning import loggers as pl_loggers
+from pytorch_lightning.callbacks import ModelCheckpoint
+import torchvision # type: ignore
 
 from dataloader import ImageDataModule
 
 RGB_CHANNELS: int = 3
 IMAGE_HEIGHT: int = 256
 IMAGE_WIDTH: int = 256
+CONFIG_YAML: str = "config.yaml"
+CHECKPOINTS_DIR: str = "checkpoints"
 
 
 class Downsample(nn.Module):
@@ -186,7 +191,7 @@ class ImageQuantizer(pl.LightningModule):
         )
         self.decoder: nn.Module = Decoder(config)
         self.config: Any = config
-        self.wrote_true_images = set()
+        self.wrote_true_images: Set[int] = set()
 
     def get_temperature(self) -> float:
         iteration = self.global_step
@@ -202,6 +207,10 @@ class ImageQuantizer(pl.LightningModule):
     def forward(self, x: torch.Tensor, temperature: float) -> List[torch.Tensor]:  # type: ignore
         encoded = self.encoder(x)
         return [q(encoded, temperature) for q in self.quantizers]
+
+    def encode(self, batch: torch.Tensor) -> torch.Tensor:
+        quantized = self.forward(batch, temperature=0.1)
+        return torch.stack([torch.argmax(q, dim=1) for q in quantized], dim=1)
 
     def autoencode(self, batch: torch.Tensor) -> torch.Tensor:
         temperature = self.get_temperature()
@@ -251,7 +260,6 @@ def main():
 @main.command("train")
 @click.argument("config_path")
 @click.option("--data", "data_path", default="data", help="Path to dataset")
-@click.option("--checkpoint", help="Path to checkpoint")
 @click.option("--save", "save_dir", required=True, help="Where to save")
 @click.argument("options", nargs=-1)
 def train_command(config_path, data_path, checkpoint, save_dir, options):
@@ -260,21 +268,48 @@ def train_command(config_path, data_path, checkpoint, save_dir, options):
     config.merge_with_dotlist(options)
     model = ImageQuantizer(config)
 
-    if checkpoint is not None:
+    checkpoint_dir = os.path.join(save_dir, CHECKPOINTS_DIR)
+    checkpoint = os.path.join(checkpoint_dir, "last.ckpt") 
+    if os.path.exists(checkpoint):
         model.load_state_dict(torch.load(checkpoint)["state_dict"])
 
     data_module = ImageDataModule(config, data_path, IMAGE_HEIGHT, IMAGE_WIDTH)
 
-    checkpoint_dir = os.path.join(save_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        save_top_k=1,
+        save_last=True,
+        verbose=True,
+        monitor="valid_loss",
+        mode="min",
+    )
 
     log_dir = os.path.join(save_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
 
+    OmegaConf.save(config, os.path.join(save_dir, CONFIG_YAML))
+
     tb_logger = pl_loggers.TensorBoardLogger(log_dir)
-    trainer = pl.Trainer(val_check_interval=0.05, gpus=1,
-                         default_root_dir=save_dir, logger=tb_logger)
+    trainer = pl.Trainer(
+        val_check_interval=0.05,
+        gpus=1,
+        default_root_dir=save_dir,
+        logger=tb_logger,
+        checkpoint_callback=checkpoint_callback,
+    )
     trainer.fit(model, data_module)
+
+def load_model(save_dir: str) -> Tuple[Any, ImageQuantizer]:
+    config = OmegaConf.load(os.path.join(save_dir, CONFIG_YAML))
+    model = ImageQuantizer(config)
+    checkpoint = os.path.join(save_dir, CHECKPOINTS_DIR, "last.ckpt")
+    if not os.path.exists(checkpoint):
+        raise ValueError(f"Checkpoint does not exist {checkpoint}")
+    model.load_state_dict(torch.load(checkpoint)["state_dict"])
+    model.eval()
+    model = model.cuda()
+    return config, model
 
 
 @main.command("data-loading-benchmark")
@@ -290,17 +325,41 @@ def data_loading_benchmark_command(config_path, data_path):
         print(f"Avg[i={i}]: {elapsed / (i + 1)}")
 
 
-@main.command("run")
-@click.argument("config_path")
-@click.argument("image_path")
-@click.option("--checkpoint", required=True, help="Path to checkpoint")
+@main.command("process-dataset")
+@click.option("--save", "save_dir", required=True, help="Where to save")
+@click.option("--data", "data_path", default="data", help="Path to dataset")
 @click.option("--output", required=True, help="Path to write to")
-def run_command(config_path, image_path, checkpoint, output):
+def process_dataset_command(save_dir, data_path, output):
     """Run the quantizer."""
-    config = OmegaConf.load(config_path)
-    model = ImageQuantizer(config)
-    model.load_state_dict(torch.load(checkpoint)["state_dict"])
+    config, model = load_model(save_dir)
+    filenames = glob.glob(os.path.join(data_path, "*", "*", "*", "*.jpg"))
+    created_dirs = set()
+    start_time = time.time()
+    for i, filename in enumerate(filenames):
+        output_file = os.path.join(output, filename[:-4] + ".npy")
+        output_dir = os.path.dirname(output_file)
+        if output_dir not in created_dirs:
+            os.makedirs(output_dir, exist_ok=True)
+            created_dirs.add(output_dir)
+        image = Image.open(filename).convert("RGB")
+        with torch.no_grad():
+            transform = torchvision.transforms.ToTensor()
+            image_tensor = transform(image).cuda()
+            predicted = model.encode(image_tensor.unsqueeze(0)).squeeze(0)
+            predicted = predicted.cpu().numpy().astype("uint16")
+            np.save(output_file, predicted)
+        if i % 10 == 0:
+            elapsed = int(time.time() - start_time)
+            print(f"Processed file {i + 1} of {len(filenames)} (in {elapsed} seconds)...")
 
+
+@main.command("run")
+@click.argument("image_path")
+@click.option("--save", "save_dir", required=True, help="Where to save")
+@click.option("--output", required=True, help="Path to write to")
+def run_command(save_dir, image_path, output):
+    """Run the quantizer."""
+    config, model = load_model(save_dir)
     image = Image.open(image_path).convert("RGB")
     transforms = torchvision.transforms.Compose(
         [
