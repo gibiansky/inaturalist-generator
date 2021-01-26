@@ -2,7 +2,7 @@ encoder:
   init_channels: 16
   init_kernel_size: 9
   downsampling: [2, 2, 2, 2, 2]
-  layers_per_scale: 2
+  layers_per_scale: 3
   kernel_size: 5
 
 quantizers:
@@ -17,11 +17,11 @@ decoder:
   init_channels: 1024
   final_kernel_size: 9
   upsampling: [2, 2, 2, 2, 2]
-  layers_per_scale: 2
+  layers_per_scale: 3
   kernel_size: 5
 
 data:
   batch_size: 8
 
 adam:
-  lr: 2.0e-4
+  lr: 1.0e-4
